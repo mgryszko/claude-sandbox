@@ -1,0 +1,14 @@
+{
+  "name": "sclaude",
+  "description": "Run Claude Code in a mise sandbox with a per-user config the sandbox can't change",
+  "owner": {
+    "name": "Marcin Gryszko"
+  },
+  "plugins": [
+    {
+      "name": "sclaude",
+      "source": "./",
+      "description": "Set up and change the config of sclaude, which runs Claude Code in a mise sandbox"
+    }
+  ]
+}

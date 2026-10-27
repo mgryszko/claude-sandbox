@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# Runs Claude Code in a mise sandbox (macOS Seatbelt). The writable paths and the environment variables
+# come from a config file that the sandbox itself cannot write.
+set -euo pipefail
+
+VERSION="0.1.0"
+repo="mgryszko/sclaude"
+config="${SCLAUDE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sclaude/config}"
+
+die() {
+  echo "sclaude: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<USAGE
+Usage:
+  sclaude [claude args...]         Start Claude in the sandbox, from a folder listed under [projects]
+  sclaude sandbox init             Write the default config
+  sclaude sandbox show             Print the config with paths expanded
+  sclaude sandbox path             Print where the config is
+  sclaude sandbox add-project DIR  Let Claude start in DIR and write to it
+  sclaude sandbox add-write PATH   Let Claude write to PATH
+  sclaude sandbox add-env VAR      Pass VAR into the sandbox (wildcards such as AWS_* or * allowed)
+  sclaude sandbox remove ENTRY     Remove a path or a variable from the config
+  sclaude sandbox version          Print the installed version
+  sclaude sandbox update           Install the latest release over this script
+  sclaude sandbox help             Print this help
+
+Config: $config (override with SCLAUDE_CONFIG)
+Set SCLAUDE_NO_UPDATE_CHECK=1 to skip the daily check for a new release.
+USAGE
+}
+
+# Prints the version of the latest GitHub release, without the leading v.
+latest_version() {
+  curl -fsS --max-time "$1" "https://api.github.com/repos/$repo/releases/latest" |
+    sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# Succeeds when version $1 is newer than version $2.
+version_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, "."); n = na > nb ? na : nb
+    for (i = 1; i <= n; i++) {
+      if (x[i] + 0 > y[i] + 0) exit 0
+      if (x[i] + 0 < y[i] + 0) exit 1
+    }
+    exit 1
+  }'
+}
+
+# At most once a day, and only in a terminal, tells about a newer release. It never updates by itself.
+update_notice() {
+  [[ -t 2 && ${SCLAUDE_NO_UPDATE_CHECK:-} != 1 ]] || return 0
+  local stamp="${XDG_STATE_HOME:-$HOME/.local/state}/sclaude/last-update-check" latest
+  if [[ -f $stamp && -z $(find "$stamp" -mmin +1440 2>/dev/null) ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$stamp")" 2>/dev/null && touch "$stamp" 2>/dev/null || true
+  latest="$(latest_version 2 2>/dev/null)" || return 0
+  if [[ -n $latest ]] && version_gt "$latest" "$VERSION"; then
+    echo "sclaude $latest is available ($VERSION installed), update with: sclaude sandbox update" >&2
+  fi
+}
+
+sandbox_update() {
+  [[ ${SCLAUDE_SANDBOXED:-} != 1 ]] || die "update runs outside the sandbox, which can't write this script"
+  local self latest tmp clone
+  self="$(realpath "$0")"
+  if clone="$(git -C "$(dirname "$self")" rev-parse --show-toplevel 2>/dev/null)"; then
+    die "$self is in a git clone, update it with: git -C $clone pull"
+  fi
+  latest="$(latest_version 10)" || die "can't reach GitHub to find the latest release"
+  [[ -n $latest ]] || die "no release found for $repo"
+  if ! version_gt "$latest" "$VERSION"; then
+    echo "sclaude $VERSION is the latest version"
+    return 0
+  fi
+  tmp="$(mktemp "$self.XXXXXX")"
+  if ! curl -fsSL "https://raw.githubusercontent.com/$repo/v$latest/bin/sclaude" -o "$tmp" || ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    die "couldn't download sclaude $latest"
+  fi
+  chmod 755 "$tmp"
+  # mv swaps in a new file, so this running script keeps reading the old one.
+  mv "$tmp" "$self"
+  echo "Updated sclaude $VERSION to $latest in $self"
+}
+
+default_config() {
+  cat <<'CONFIG'
+# sclaude config. Change it with `sclaude sandbox ...` or by hand, outside the sandbox.
+# Paths are absolute or start with ~, $HOME or $TMPDIR. Changes apply the next time Claude starts.
+
+# Folders Claude may start in and write to. sclaude refuses to start anywhere else.
+[projects]
+
+# Other paths Claude may write to. Everything else on disk is read-only, except /tmp and /dev.
+[write]
+~/.claude
+~/.claude.json
+~/.local/state/claude
+$TMPDIR
+
+# Environment variables passed in. PATH HOME USER SHELL TERM COLORTERM LANG always pass.
+[env]
+ANTHROPIC_*
+CLAUDE_*
+LC_*
+CONFIG
+}
+
+expand_path() {
+  local path="$1" tmp="${TMPDIR:-/tmp}"
+  case $path in
+    "~" | "~/"*) path="$HOME${path#"~"}" ;;
+    '$HOME' | '$HOME/'*) path="$HOME${path#'$HOME'}" ;;
+    '$TMPDIR' | '$TMPDIR/'*) path="${tmp%/}${path#'$TMPDIR'}" ;;
+  esac
+  [[ $path == /* ]] || die "not an absolute path: $1"
+  echo "$path"
+}
+
+# Resolves symlinks. A path that doesn't exist yet resolves through its parent folder.
+resolve() {
+  if [[ -e $1 ]]; then
+    realpath "$1"
+  elif [[ -d $(dirname "$1") ]]; then
+    echo "$(realpath "$(dirname "$1")")/$(basename "$1")"
+  else
+    echo "$1"
+  fi
+}
+
+# Shortens $HOME to ~, the way paths are stored in the config.
+abbreviate() {
+  if [[ $1 == "$HOME" ]]; then
+    echo "~"
+  elif [[ $1 == "$HOME"/* ]]; then
+    echo "~/${1#"$HOME"/}"
+  else
+    echo "$1"
+  fi
+}
+
+read_config() {
+  [[ -f $config ]] || die "no config at $config, create it with: sclaude sandbox init"
+  projects=()
+  writable=()
+  env_allowed=()
+  local line path section="" n=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case $line in
+      "") ;;
+      "[projects]") section=projects ;;
+      "[write]") section=write ;;
+      "[env]") section=env ;;
+      "["*) die "$config:$n: unknown section $line" ;;
+      *)
+        case $section in
+          projects)
+            path="$(expand_path "$line")"
+            projects+=("$path")
+            ;;
+          write)
+            path="$(expand_path "$line")"
+            writable+=("$path")
+            ;;
+          env) env_allowed+=("$line") ;;
+          *) die "$config:$n: entry outside a section: $line" ;;
+        esac
+        ;;
+    esac
+  done <"$config"
+}
+
+# What runs or is read outside the sandbox when Claude starts: the config, this script, the claude and mise
+# binaries and mise's global config. Symlinks are listed both as the link and as its target.
+protected_paths() {
+  local path
+  for path in "$config" "$0" "$(command -v claude)" "$(command -v mise)" \
+    "${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}"; do
+    echo "$path"
+    resolve "$path"
+  done
+}
+
+check_writable() {
+  local entry="$1" resolved protected
+  resolved="$(resolve "$entry")"
+  [[ $resolved != / ]] || die "writable path $entry is the whole disk"
+  while IFS= read -r protected; do
+    if [[ $protected == "$resolved" || $protected == "$resolved"/* || $resolved == "$protected"/* ]]; then
+      die "writable path $entry overlaps $protected, the sandbox could change what runs outside it"
+    fi
+  done < <(protected_paths)
+}
+
+check_cwd() {
+  local cwd project
+  cwd="$(realpath "$PWD")"
+  for project in ${projects[@]+"${projects[@]}"}; do
+    project="$(resolve "$project")"
+    if [[ $cwd == "$project" || $cwd == "$project"/* ]]; then
+      return 0
+    fi
+  done
+  local hint="sclaude sandbox add-project $PWD" answer
+  [[ -t 0 && -t 2 ]] || die "$PWD is not in a project listed in $config, add it with: $hint"
+
+  # Asked before the sandbox starts, so Claude can't answer it.
+  read -r -p "sclaude: $PWD is not in a project listed in $config. Add it as a project? [y/N] " answer || answer=""
+  [[ $answer == [yY]* ]] || die "not started, add the folder later with: $hint"
+  check_writable "$cwd"
+  insert_entry projects "$(abbreviate "$cwd")"
+  projects+=("$cwd")
+  echo "Added $(abbreviate "$cwd") to [projects]." >&2
+}
+
+run_claude() {
+  read_config
+  check_cwd
+  update_notice
+
+  # SCLAUDE_SANDBOXED tells the sandbox-config skill it runs inside the sandbox, where it can't change the config.
+  export SCLAUDE_SANDBOXED=1
+  local path var sandbox_args=(--deny-write --deny-env --allow-env=SCLAUDE_SANDBOXED)
+  for path in ${projects[@]+"${projects[@]}"} ${writable[@]+"${writable[@]}"}; do
+    check_writable "$path"
+    sandbox_args+=("--allow-write=$path")
+  done
+  for var in ${env_allowed[@]+"${env_allowed[@]}"}; do
+    sandbox_args+=("--allow-env=$var")
+  done
+
+  local prompt
+  prompt="$(
+    cat <<PROMPT
+Run inside mise sandbox (macOS Seatbelt). Writes restricted to these paths + subdirs, plus /tmp and /dev:
+$(printf -- '- %s\n' ${projects[@]+"${projects[@]}"} ${writable[@]+"${writable[@]}"})
+Rest of disk: readable, not writable.
+
+Env vars filtered. Only these reach you: ${env_allowed[*]-} PATH HOME USER SHELL TERM COLORTERM LANG.
+
+Cmd fails "Operation not permitted", file write fails no reason, subprocess/MCP server exits immediately, or tool reports missing creds/config: check sandbox first, before assuming tool bug. Report blocked path/missing var to user so they can widen the policy outside the sandbox (sclaude sandbox add-write/add-env). Don't work around sandbox, don't retry same op elsewhere on disk.
+PROMPT
+  )"
+
+  # mise reads its config, installs tools and runs hooks outside the sandbox. Started in a project, it would
+  # load that project's mise.toml, which Claude can write. From / it loads only the global config.
+  local project_dir="$PWD"
+  cd /
+  exec mise exec "${sandbox_args[@]}" -- \
+    sh -c 'cd "$1" && shift && exec claude "$@"' sh "$project_dir" --append-system-prompt "$prompt" "$@"
+}
+
+sandbox_init() {
+  [[ ! -e $config ]] || die "$config already exists"
+  mkdir -p "$(dirname "$config")"
+  default_config >"$config"
+  echo "Wrote $config. Add a project with: sclaude sandbox add-project DIR"
+}
+
+sandbox_show() {
+  read_config
+  echo "# $config"
+  echo "[projects]"
+  printf '%s\n' ${projects[@]+"${projects[@]}"}
+  echo "[write]"
+  printf '%s\n' ${writable[@]+"${writable[@]}"}
+  echo "[env]"
+  printf '%s\n' ${env_allowed[@]+"${env_allowed[@]}"}
+}
+
+# Inserts the entry right under its section header, or appends the section when it's missing.
+insert_entry() {
+  local section="$1" entry="$2" tmp
+  tmp="$(mktemp "$config.XXXXXX")"
+  awk -v header="[$section]" -v entry="$entry" '
+    { line = $0; sub(/[ \t]+$/, "", line) }
+    line == header && !done { print; print entry; done = 1; next }
+    { print }
+    END { if (!done) { print ""; print header; print entry } }
+  ' "$config" >"$tmp"
+  mv "$tmp" "$config"
+}
+
+add_path() {
+  local section="$1" given="${2:-}" path existing
+  [[ -n $given ]] || die "missing path"
+  if [[ $section == projects ]]; then
+    [[ -d $given ]] || die "$given is not a folder"
+  fi
+  case $given in
+    /* | "~"* | '$HOME'* | '$TMPDIR'*) path="$(expand_path "$given")" ;;
+    *) path="$PWD/$given" ;;
+  esac
+  path="$(resolve "$path")"
+
+  read_config
+  check_writable "$path"
+  for existing in ${projects[@]+"${projects[@]}"} ${writable[@]+"${writable[@]}"}; do
+    if [[ $(resolve "$existing") == "$path" ]]; then
+      die "$(abbreviate "$path") is already in $config"
+    fi
+  done
+  insert_entry "$section" "$(abbreviate "$path")"
+  echo "Added $(abbreviate "$path") to [$section]. Restart Claude to apply it."
+}
+
+add_env() {
+  local var="${1:-}" existing
+  [[ -n $var ]] || die "missing variable"
+  [[ $var == "*" || $var =~ ^[A-Za-z_][A-Za-z0-9_]*\*?$ ]] || die "$var is not a variable name, a NAME_* pattern or *"
+  read_config
+  for existing in ${env_allowed[@]+"${env_allowed[@]}"}; do
+    [[ $existing != "$var" ]] || die "$var is already in $config"
+  done
+  insert_entry env "$var"
+  echo "Added $var to [env]. Restart Claude to apply it."
+}
+
+remove_entry() {
+  local entry="${1:-}" stored tmp status
+  [[ -n $entry ]] || die "missing entry"
+  stored="$entry"
+  if [[ $entry == /* || -e $entry ]]; then
+    stored="$(abbreviate "$(resolve "$entry")")"
+  fi
+  tmp="$(mktemp "$config.XXXXXX")"
+  status=0
+  awk -v a="$entry" -v b="$stored" '
+    { line = $0; sub(/#.*/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line) }
+    line != "" && (line == a || line == b) { removed++; next }
+    { print }
+    END { exit (removed == 1 ? 0 : (removed == 0 ? 1 : 2)) }
+  ' "$config" >"$tmp" || status=$?
+  if [[ $status -ne 0 ]]; then
+    rm -f "$tmp"
+    [[ $status -ne 2 ]] || die "$entry is in more than one section of $config, remove it by hand"
+    die "$entry is not in $config"
+  fi
+  mv "$tmp" "$config"
+  echo "Removed $entry. Restart Claude to apply it."
+}
+
+sandbox_command() {
+  local command="${1:-}"
+  [[ $# -eq 0 ]] || shift
+  case $command in
+    init) sandbox_init ;;
+    show) sandbox_show ;;
+    path) echo "$config" ;;
+    add-project) add_path projects "$@" ;;
+    add-write) add_path write "$@" ;;
+    add-env) add_env "$@" ;;
+    remove) remove_entry "$@" ;;
+    version) echo "sclaude $VERSION" ;;
+    update) sandbox_update ;;
+    help | -h | --help) usage ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+if [[ ${1:-} == sandbox ]]; then
+  shift
+  sandbox_command "$@"
+else
+  run_claude "$@"
+fi
