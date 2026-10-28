@@ -1,7 +1,7 @@
 {
   "name": "sclaude",
   "description": "Set up and change the config of sclaude, which runs Claude Code in a mise sandbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "0BSD",
   "author": {
     "name": "Marcin Gryszko"

@@ -42,7 +42,7 @@ If `show` fails with "no config", do the first setup. Otherwise do the change th
 
 | Tool | Entries |
 |---|---|
-| AWS CLI with SSO | `add-write ~/.aws/sso/cache`, `add-write ~/.aws/cli/cache`, `add-env 'AWS_*'` |
+| AWS CLI and SDKs | `add-env 'AWS_*'`, plus the cache folder of each way the user's profiles sign in (see below) |
 | uv | `add-write ~/.cache/uv` |
 | uv tools and `uvx` | `add-write ~/.local/share/uv/tools`. Warn first: Claude could then change the tools you installed with `uv tool install` and run outside the sandbox. |
 | marimo | `add-write ~/.local/state/marimo`, where marimo registers its running servers |
@@ -59,6 +59,16 @@ When the user brings an error from a sandboxed session, find the path or variabl
 "Operation not permitted" on a write names a path. Missing credentials or config usually mean a missing variable
 or a cache the tool can't write. If the error doesn't name it, ask the user to run the failing command again
 inside the sandbox and paste the full output.
+
+For AWS, find how the failing profile signs in, outside the sandbox, with
+`aws configure get <key> --profile <profile>` for each key below. A profile that sets none of them needs no cache.
+
+| Key set in the profile | Cache folder to add |
+|---|---|
+| `sso_session` or `sso_start_url` | `~/.aws/sso/cache` |
+| `login_session` (signed in with `aws login`) | `~/.aws/login/cache` |
+| `role_arn` with `source_profile` | `~/.aws/cli/cache`, plus the cache of the source profile |
+| `credential_process` | whatever the command it runs writes; run it outside the sandbox and look |
 
 Propose the narrowest entry that fixes it: the cache folder the tool writes, not its parent, and a variable or a
 `PREFIX_*` pattern, never `*`. Say in one line what the entry lets Claude do. Run it only after the user agrees.

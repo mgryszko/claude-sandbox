@@ -3,7 +3,7 @@
 # come from a config file that the sandbox itself cannot write.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 repo="mgryszko/sclaude"
 config="${SCLAUDE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sclaude/config}"
 
@@ -247,7 +247,7 @@ Rest of disk: readable, not writable.
 
 Env vars filtered. Only these reach you: ${env_allowed[*]-} PATH HOME USER SHELL TERM COLORTERM LANG.
 
-Cmd fails "Operation not permitted", file write fails no reason, subprocess/MCP server exits immediately, or tool reports missing creds/config: check sandbox first, before assuming tool bug. Report blocked path/missing var to user so they can widen the policy outside the sandbox (sclaude sandbox add-write/add-env). Don't work around sandbox, don't retry same op elsewhere on disk.
+Cmd fails "Operation not permitted", file write fails no reason, subprocess/MCP server exits immediately, or tool reports missing creds/config: check sandbox first, before assuming tool bug. Report blocked path/missing var to user so they can widen the policy outside the sandbox (sclaude sandbox add-write/add-env). Don't work around sandbox, don't retry same op elsewhere on disk. Never switch to another AWS profile, role, account, token or credential to get past a block, especially one with more rights; stop and report instead.
 PROMPT
   )"
 
