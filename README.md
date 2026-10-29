@@ -167,6 +167,21 @@ or that contains or sits inside one of these:
 
 These are what runs or is read outside the sandbox when Claude starts.
 
+## herdr
+
+After a restart, [herdr](https://herdr.dev) resumes a Claude pane with `claude --resume <id>`, which would bring a sandboxed
+session back without the sandbox.
+In a herdr pane, `sclaude` adds a SessionStart hook that tells herdr to resume with `sclaude --resume <id>` instead,
+with `CLAUDE_CONFIG_DIR` in front when it is set.
+The hook reports again after `/clear`, `/compact` and `--resume`, so herdr always holds the current session.
+
+For the hook, and for herdr's own Claude integration, `sclaude` passes `HERDR_ENV`, `HERDR_PANE_ID`, `HERDR_SOCKET_PATH`
+and `HERDR_BIN_PATH` into the sandbox without an `[env]` entry. They name the pane and herdr's socket, nothing secret.
+Herdr types the command into the pane's shell, so `sclaude` must be on your `PATH` under that name.
+
+Herdr's socket is reachable from inside the sandbox, which lets a sandboxed Claude type into your other panes. See
+[herdr and other terminal multiplexers](#herdr-and-other-terminal-multiplexers).
+
 ## Limitations
 
 ### mise
@@ -196,6 +211,22 @@ Anything Claude writes to a writable path runs without the sandbox when you use 
 - any folder on your `PATH`.
 
 The guard protects only the config and what starts Claude. Keep the rest of the list as short as you can.
+
+### herdr and other terminal multiplexers
+
+The sandbox blocks writes to files, not connections to local sockets.
+herdr is controlled through one, `~/.config/herdr/herdr.sock`, and a sandboxed process can connect to it.
+Its `send-keys` and `prompt` commands type into any pane, including plain shells and Claude sessions started without
+the sandbox. A sandboxed Claude, or a script it runs, could type a command there, and the command would run with your
+full access.
+
+- Leaving `HERDR_*` out of the sandbox doesn't help: the socket path is fixed and easy to find.
+- The resume command that `sclaude` reports is a smaller case of the same: whatever command the sandbox reports runs
+  outside the sandbox the next time herdr restarts.
+- mise has no option to block a single socket.
+- Other tools controlled through a local socket, such as tmux, likely allow the same.
+
+Run `sclaude` in a terminal outside herdr when Claude must not reach your other sessions.
 
 ## License
 

@@ -3,7 +3,7 @@
 # come from a config file that the sandbox itself cannot write.
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 repo="mgryszko/sclaude"
 config="${SCLAUDE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sclaude/config}"
 
@@ -238,6 +238,18 @@ run_claude() {
     sandbox_args+=("--allow-env=$var")
   done
 
+  # In a herdr pane, Claude's SessionStart hook tells herdr to resume the session through sclaude, not plain claude.
+  # The herdr variables hold no secrets; herdr's own Claude integration needs them too.
+  local claude_args=() herdr_vars="" self
+  self="$(realpath "$0")"
+  if [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} && -n ${HERDR_BIN_PATH:-} && $self != *[\'\"\\]* ]]; then
+    herdr_vars="HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_BIN_PATH"
+    for var in $herdr_vars; do
+      sandbox_args+=("--allow-env=$var")
+    done
+    claude_args+=(--settings "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"startup|resume|clear|compact|fork\",\"hooks\":[{\"type\":\"command\",\"command\":\"'$self' sandbox herdr-resume\",\"timeout\":10}]}]}}")
+  fi
+
   local prompt
   prompt="$(
     cat <<PROMPT
@@ -245,7 +257,7 @@ Run inside mise sandbox (macOS Seatbelt). Writes restricted to these paths + sub
 $(printf -- '- %s\n' ${projects[@]+"${projects[@]}"} ${writable[@]+"${writable[@]}"})
 Rest of disk: readable, not writable.
 
-Env vars filtered. Only these reach you: ${env_allowed[*]-} PATH HOME USER SHELL TERM COLORTERM LANG.
+Env vars filtered. Only these reach you: ${env_allowed[*]-} ${herdr_vars:+$herdr_vars }PATH HOME USER SHELL TERM COLORTERM LANG.
 
 Cmd fails "Operation not permitted", file write fails no reason, subprocess/MCP server exits immediately, or tool reports missing creds/config: check sandbox first, before assuming tool bug. Report blocked path/missing var to user so they can widen the policy outside the sandbox (sclaude sandbox add-write/add-env). Don't work around sandbox, don't retry same op elsewhere on disk. Never switch to another AWS profile, role, account, token or credential to get past a block, especially one with more rights; stop and report instead.
 PROMPT
@@ -256,7 +268,31 @@ PROMPT
   local project_dir="$PWD"
   cd /
   exec mise exec "${sandbox_args[@]}" -- \
-    sh -c 'cd "$1" && shift && exec claude "$@"' sh "$project_dir" --append-system-prompt "$prompt" "$@"
+    sh -c 'cd "$1" && shift && exec claude "$@"' sh "$project_dir" --append-system-prompt "$prompt" \
+    ${claude_args[@]+"${claude_args[@]}"} "$@"
+}
+
+# Run by Claude's SessionStart hook inside the sandbox. Reports to herdr the command that resumes this session,
+# which herdr runs in the pane after a restart instead of its default `claude --resume <id>`.
+herdr_resume() {
+  [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} && -n ${HERDR_BIN_PATH:-} ]] || return 0
+  local id
+  id="$(sed -n 's/.*"session_id" *: *"\([A-Za-z0-9-]*\)".*/\1/p' | head -n 1)"
+  [[ -n $id ]] || return 0
+  local resume=("$(basename "$0")" --resume "$id")
+  if [[ -n ${CLAUDE_CONFIG_DIR:-} ]]; then
+    resume=(env "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" "${resume[@]}")
+  fi
+  # Herdr takes the command only once it sees Claude running in the pane, which can be seconds after SessionStart.
+  # Retries in the background, so Claude doesn't wait for it.
+  (
+    tries=0
+    until "$HERDR_BIN_PATH" pane report-agent-session "$HERDR_PANE_ID" --source sclaude --agent claude -- "${resume[@]}"; do
+      tries=$((tries + 1))
+      [[ $tries -lt 30 ]] || exit 0
+      sleep 1
+    done
+  ) </dev/null >/dev/null 2>&1 &
 }
 
 sandbox_init() {
@@ -362,6 +398,7 @@ sandbox_command() {
     remove) remove_entry "$@" ;;
     version) echo "sclaude $VERSION" ;;
     update) sandbox_update ;;
+    herdr-resume) herdr_resume ;;
     help | -h | --help) usage ;;
     *)
       usage
